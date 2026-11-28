@@ -20417,8 +20417,19 @@ class DedicatedRunnerTest(unittest.TestCase):
     build, the iOS internal archive) is a manifest runner.dedicated entry that glaeda-cmux-runner --dedicated installs:
     glaeda's release, .path, hooks, gate and disk floor, with exactly its own labels, scope and admission."""
 
-    setUp, tearDown, build_release = RunnerTest.setUp, RunnerTest.tearDown, RunnerTest.build_release
+    tearDown, build_release = RunnerTest.tearDown, RunnerTest.build_release
     invoke, log, by_kind, config_argvs = RunnerTest.invoke, RunnerTest.log, RunnerTest.by_kind, RunnerTest.config_argvs
+
+    def setUp(self) -> None:
+        RunnerTest.setUp(self)
+        # the LAN relay is a system LaunchDaemon: keep its plist under the test HOME and run its root steps unprivileged
+        (self.home / "Library/LaunchDaemons").mkdir(parents=True, exist_ok=True)
+        for patch in (mock.patch.object(cr, "SYSTEM_DAEMON_DIR", self.home / "Library/LaunchDaemons"),
+                      mock.patch.object(cr, "priv", lambda ctx, argv: argv),
+                      mock.patch.object(cr, "install_system_file",
+                                        lambda ctx, path, data, mode: cr.write_atomic(path, data, mode))):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def manifest(self, *entries: dict) -> str:
         path = self.state / "mini-fleet.json"
@@ -20963,9 +20974,11 @@ class DedicatedRunnerTest(unittest.TestCase):
             path.write_text(json.dumps(manifest_doc(entry)))
             return os.fspath(path)
 
-        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home), pw_gid=20)
+        fake_pw.pw_name = "relayuser"
         label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.fleet-route"
         agents = self.home / "Library/LaunchAgents"
+        daemons = self.home / "Library/LaunchDaemons"
         socket_dir = self.home / ".local/state/glaeda/lan-relay"
         args = ("--member", "mini-std", "--dedicated", "fleet-route")
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
@@ -20973,13 +20986,19 @@ class DedicatedRunnerTest(unittest.TestCase):
             receipt = self.invoke("--apply", "--manifest", write(relayed), *args)
         self.assertTrue(receipt["ready"], receipt["blocking"])
         self.assertEqual(self.by_kind(receipt)["relay"]["label"], f"{label}.relay")
-        relay = plistlib.loads((agents / f"{label}.relay.plist").read_bytes())
+        relay = plistlib.loads((daemons / f"{label}.relay.plist").read_bytes())
         self.assertEqual(relay["ProgramArguments"],
                          ["/usr/bin/nc", "-G", str(cr.LAN_RELAY_CONNECT_S), "-w", str(cr.LAN_RELAY_IDLE_S),
                           "172.20.1.5", "22"])
         self.assertEqual(relay["inetdCompatibility"], {"Wait": False})
         self.assertEqual(relay["Sockets"], {"Listener": {"SockPathName": os.fspath(socket_dir / "fleet-route.sock"),
-                                                         "SockPathMode": 0o600, "SockType": "stream"}})
+                                                         "SockPathMode": 0o600, "SockPathOwner": os.getuid(),
+                                                         "SockPathGroup": 20, "SockType": "stream"}})
+        # a LaunchDaemon (system domain) run as the relay user, so it outlives a logout (incident #1174)
+        self.assertEqual(relay["UserName"], "relayuser")
+        self.assertFalse((agents / f"{label}.relay.plist").exists(), "no gui LaunchAgent for the relay")
+        self.assertIn(["bootstrap", "system", os.fspath(daemons / f"{label}.relay.plist")],
+                      [e["argv"] for e in self.log() if e["tool"] == "launchctl"])
         self.assertNotIn("KeepAlive", relay)
         self.assertNotIn("EnvironmentVariables", relay, "the relay holds no key and reads no job input")
         self.assertEqual(stat.S_IMODE(socket_dir.stat().st_mode), 0o700)
@@ -20994,7 +21013,7 @@ class DedicatedRunnerTest(unittest.TestCase):
             stale.bind(os.fspath(socket_dir / "fleet-route.sock"))
             again = self.invoke("--apply", "--manifest", write(changed), *args)
         self.assertEqual(self.by_kind(again)["relay"]["state"], "update")
-        self.assertIn("172.20.1.6", plistlib.loads((agents / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
+        self.assertIn("172.20.1.6", plistlib.loads((daemons / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
         self.assertFalse((socket_dir / "fleet-route.sock").exists())
         self.assertEqual(stat.S_IMODE(socket_dir.stat().st_mode), 0o700)
         # LAN_RELAY_ADAPTERS: a list runs Apple's /bin/sh with the fixed loop over Apple's nc, the addresses as
@@ -21003,7 +21022,7 @@ class DedicatedRunnerTest(unittest.TestCase):
                 mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
             listed = self.invoke("--apply", "--manifest", write({**relayed, "lanRelay": adapters}), *args)
         self.assertEqual(self.by_kind(listed)["relay"]["state"], "update")
-        relay = plistlib.loads((agents / f"{label}.relay.plist").read_bytes())
+        relay = plistlib.loads((daemons / f"{label}.relay.plist").read_bytes())
         self.assertEqual(relay["ProgramArguments"],
                          ["/bin/sh", "-c", cr.LAN_RELAY_LOOP, "glaeda-lan-relay", str(cr.LAN_RELAY_CONNECT_S),
                           str(cr.LAN_RELAY_IDLE_S), "22", "172.20.1.6", "172.20.1.5"])
@@ -21021,11 +21040,11 @@ class DedicatedRunnerTest(unittest.TestCase):
                 mock.patch.object(cr, "SOCKET_PATH_MAX", 4096), mock.patch.object(cr, "runner_busy", return_value=True):
             busy = self.invoke("--apply", "--manifest", write(relayed), *args, expect=1)
         self.assertEqual(self.by_kind(busy)["relay"]["state"], "failed")
-        self.assertIn("172.20.1.6", plistlib.loads((agents / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
+        self.assertIn("172.20.1.6", plistlib.loads((daemons / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
                 mock.patch.object(cr, "runner_busy", return_value=True):
             busy = self.invoke("--uninstall", "--apply", "--manifest", write(relayed), *args, expect=1)
-        self.assertTrue((agents / f"{label}.relay.plist").exists(), "nothing removed under a job")
+        self.assertTrue((daemons / f"{label}.relay.plist").exists(), "nothing removed under a job")
         self.assertTrue((agents / f"{label}.plist").exists())
         (self.state / "loaded.json").unlink()
         # a socket path longer than sun_path refuses the relay, and nothing is written
@@ -21037,20 +21056,20 @@ class DedicatedRunnerTest(unittest.TestCase):
             self.invoke("--apply", "--manifest", write(relayed), *args)
         # the manifest drops lanRelay: the relay agent this install wrote is booted out and removed, even when its
         # plist was deleted by hand while launchd still runs it
-        (agents / f"{label}.relay.plist").unlink()
+        (daemons / f"{label}.relay.plist").unlink()
         (self.state / "loaded.json").write_text(json.dumps([f"{label}.relay"]))
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
             dropped = self.invoke("--apply", "--manifest", write(route), *args)
         self.assertEqual(self.by_kind(dropped)["relay"]["state"], "remove")
-        self.assertFalse((agents / f"{label}.relay.plist").exists())
-        self.assertIn(["bootout", f"gui/{os.getuid()}/{label}.relay"],
+        self.assertFalse((daemons / f"{label}.relay.plist").exists())
+        self.assertIn(["bootout", f"system/{label}.relay"],
                       [e["argv"] for e in self.log() if e["tool"] == "launchctl"])
         # and an uninstall removes it with the runner
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
                 mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
             self.invoke("--apply", "--manifest", write(relayed), *args)
             self.invoke("--uninstall", "--apply", "--manifest", write(relayed), *args)
-        self.assertFalse((agents / f"{label}.relay.plist").exists())
+        self.assertFalse((daemons / f"{label}.relay.plist").exists())
         self.assertFalse((agents / f"{label}.plist").exists())
         self.assertEqual(self.by_kind(receipt)["relay"]["socket"], os.fspath(socket_dir / "fleet-route.sock"))
         # by receipt alone (no manifest entry in ctx): the recorded socket, else the label's name, and only a socket
@@ -21068,6 +21087,43 @@ class DedicatedRunnerTest(unittest.TestCase):
             cr.remove_relay_socket(ctx, {"label": f"{label}.relay", "socket": os.fspath(elsewhere)})
             self.assertTrue(elsewhere.exists(), "never outside the relay directory")
             cr.remove_relay_socket(ctx, {"label": "unrelated"})
+
+    def test_a_lan_relay_reconciles_a_stale_gui_agent_into_the_system_daemon(self) -> None:
+        """Incident #1174: an install that left the relay a gui/<uid> LaunchAgent (it dies at logout) is moved to the
+        system LaunchDaemon: the agent is booted out and its plist removed, the daemon written and bootstrapped, and a
+        second apply changes nothing."""
+        route = {"name": "fleet-route", "repo": "manaflow-ai/cmuxterm-hq", "trustedRef": "refs/heads/main",
+                 "trustedRepo": "manaflow-ai/cmuxterm-hq", "admit": ["/usr/bin/true"],
+                 "labels": ["glaeda-hq-fleet-route", "glaeda-runner-mini-std-fleet-route"],
+                 "lanRelay": "172.20.1.5:22"}
+        doc = dedicated_manifest(route)
+        doc["hosts"]["mini-std"]["overrides"]["runner"]["dedicatedOnly"] = True
+        manifest = self.state / "mini-fleet.json"
+        manifest.write_text(json.dumps(doc))
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home), pw_gid=20)
+        fake_pw.pw_name = "relayuser"
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.fleet-route"
+        agents, daemons = self.home / "Library/LaunchAgents", self.home / "Library/LaunchDaemons"
+        args = ("--apply", "--manifest", os.fspath(manifest), "--member", "mini-std", "--dedicated", "fleet-route")
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
+            self.invoke(*args)
+            legacy = agents / f"{label}.relay.plist"
+            legacy.write_bytes(b"<plist/>")  # what the old installer wrote
+            (daemons / f"{label}.relay.plist").unlink()
+            (self.state / "loaded.json").write_text(json.dumps([f"{label}.relay"]))
+            moved = self.invoke(*args)
+            self.assertEqual(self.by_kind(moved)["relay"]["legacyAgent"], os.fspath(legacy))
+            self.assertFalse(legacy.exists())
+            self.assertEqual(plistlib.loads((daemons / f"{label}.relay.plist").read_bytes())["UserName"], "relayuser")
+            argvs = [e["argv"] for e in self.log() if e["tool"] == "launchctl"]
+            self.assertIn(["bootout", f"gui/{os.getuid()}/{label}.relay"], argvs)
+            self.assertIn(["bootstrap", "system", os.fspath(daemons / f"{label}.relay.plist")], argvs)
+            # the fake launchctl tracks labels, not domains: say the gui agent is gone for good
+            (self.state / "loaded.json").write_text("[]")
+            again = self.invoke(*args)
+            self.assertEqual(self.by_kind(again)["relay"]["state"], "unchanged")
+            self.assertNotIn("legacyAgent", self.by_kind(again)["relay"])
 
     def test_a_lan_relay_list_forwards_to_the_first_adapter_address_that_connects(self) -> None:
         """LAN_RELAY_ADAPTERS: the relay's loop runs nc to each declared address in order, stops at the first that
@@ -21145,14 +21201,15 @@ class DedicatedRunnerTest(unittest.TestCase):
         # the plist: the follow loop, its fixed arguments, then the declared addresses in order
         path = self.state / "mini-fleet.json"
         path.write_text(json.dumps(manifest_doc({**route, "lanRelayFollow": follow})))
-        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home), pw_gid=20)
+        fake_pw.pw_name = "relayuser"
         label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.fleet-route"
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
                 mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
             receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
                                   "--dedicated", "fleet-route")
         self.assertTrue(receipt["ready"], receipt["blocking"])
-        relay = plistlib.loads((self.home / f"Library/LaunchAgents/{label}.relay.plist").read_bytes())
+        relay = plistlib.loads((self.home / f"Library/LaunchDaemons/{label}.relay.plist").read_bytes())
         self.assertEqual(relay["ProgramArguments"],
                          ["/bin/sh", "-c", cr.LAN_RELAY_FOLLOW_LOOP, "glaeda-lan-relay", str(cr.LAN_RELAY_CONNECT_S),
                           str(cr.LAN_RELAY_IDLE_S), "22", "100.100.1.2", "nTESTNODE1CNTRL", "172.20.1.",

@@ -1599,8 +1599,16 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             act["label"] = companions[path][1]
             if kind == "relay":
                 act["socket"] = os.fspath(relay_socket(ctx))
-            act["loaded"] = None if ctx.skip_launchctl else run(
-                [LAUNCHCTL, "print", f"{agent_domain(ctx)}/{act['label']}"])[0] == 0
+            act["loaded"] = None if ctx.skip_launchctl else companion_loaded(ctx, act["label"])
+            if kind == "relay":
+                legacy = relay_legacy_agent_path(ctx)
+                stale = legacy.exists() or (not ctx.skip_launchctl and
+                                            run([LAUNCHCTL, "print", f"{agent_domain(ctx)}/{act['label']}"])[0] == 0)
+                if stale:
+                    act["legacyAgent"] = os.fspath(legacy)
+                    if state == "unchanged":
+                        act["state"] = state = "update"
+                        act["note"] = "moves the relay off its gui LaunchAgent (it dies at logout)"
         if kind == "agent":
             act["label"] = ctx.label
             act["loaded"] = launchctl_loaded(ctx)
@@ -1620,7 +1628,7 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         for old in [a for a in (receipt or {}).get("actions", [])
                     if a.get("kind") in COMPANIONS and a.get("kind") not in declared and a.get("owned")]:
             current = sha256_file(Path(str(old.get("path"))))
-            loaded = not ctx.skip_launchctl and run([LAUNCHCTL, "print", f"{agent_domain(ctx)}/{old.get('label')}"])[0] == 0
+            loaded = not ctx.skip_launchctl and companion_loaded(ctx, str(old.get("label")))
             if current is not None or loaded:
                 # a plist removed by hand while launchd still runs the job: ours by the receipt, booted out all the same
                 ours = current is None or current == old.get("ownedSha256")
@@ -2285,7 +2293,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
-        elif kind == "relay" and state in {"create", "update", "remove"} and act.get("loaded") and runner_busy(ctx):
+        elif kind == "relay" and state in {"create", "update", "remove"} \
+                and (act.get("loaded") or act.get("legacyAgent")) and runner_busy(ctx):
             # a job may be talking through the relay: unloading it now would cut that connection
             act["state"], act["note"] = "failed", ("the runner has a job that may use the relay; nothing changed, "
                                                    "re-run when idle")
@@ -2294,17 +2303,21 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             # sees the change again instead of an "unchanged" plist under an old process
             if not ctx.skip_launchctl and not bootout_watch(ctx, act["label"]):
                 act["state"], act["note"] = "failed", f"launchd still has the old {kind} agent; nothing written, re-run"
-            elif kind == "relay" and (why := prepare_relay_dir(ctx)):
+            elif kind == "relay" and (why := prepare_relay_dir(ctx) or drop_legacy_relay(ctx, act)):
                 act["state"], act["note"] = "failed", why[:400]
             else:
                 data, mode = desired_files(ctx)[Path(act["path"])]
-                write_atomic(Path(act["path"]), data, mode)
-                act["applied"] = act["owned"] = True
-                act["ownedSha256"] = act["sha256"]
-                if not ctx.skip_launchctl:
-                    restart_watch(ctx, act)
+                try:
+                    install_companion_file(ctx, act, data, mode)
+                except OSError as error:
+                    act["state"], act["note"] = "failed", f"cannot write {act['path']}: {error}"[:400]
+                else:
+                    act["applied"] = act["owned"] = True
+                    act["ownedSha256"] = act["sha256"]
+                    if not ctx.skip_launchctl:
+                        restart_watch(ctx, act)
         elif kind in COMPANIONS and state == "unchanged" and not ctx.skip_launchctl and not act.get("loaded"):
-            if kind == "relay" and (why := prepare_relay_dir(ctx)):
+            if kind == "relay" and (why := prepare_relay_dir(ctx) or drop_legacy_relay(ctx, act)):
                 act["state"], act["note"] = "failed", why[:400]
             else:
                 restart_watch(ctx, act)
@@ -2313,8 +2326,9 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 # still owned, plist kept: the next apply plans the removal again
                 act["state"], act["note"] = "failed", f"launchd still has the {kind} agent; its plist is kept, re-run"
             else:
-                Path(act["path"]).unlink(missing_ok=True)
+                remove_companion_file(ctx, act)
                 if kind == "relay":
+                    relay_legacy_agent_path(ctx).unlink(missing_ok=True)
                     remove_relay_socket(ctx, act)
                 act["applied"], act["owned"], act["ownedSha256"] = True, False, None
         elif kind == "agent-move" and state == "move":
@@ -2538,8 +2552,9 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
                     f"launchd still has the {act['kind']} agent; nothing else removed, re-run" if other is act
                     else f"kept: the {act['kind']} agent did not unload")
             return
-        Path(act["path"]).unlink(missing_ok=True)
+        remove_companion_file(ctx, act)
         if act["kind"] == "relay":
+            relay_legacy_agent_path(ctx).unlink(missing_ok=True)
             remove_relay_socket(ctx, act)
         act["applied"] = True
     removing = [act for act in removing if act["kind"] not in COMPANIONS]
@@ -3989,10 +4004,10 @@ def watch_plist(ctx: Context) -> dict[str, Any]:
 def bootout_watch(ctx: Context, label: str, wait_s: float = 15.0) -> bool:
     """Unload a watch agent; True once launchd no longer has it (print exits LAUNCHCTL_NOT_FOUND), as bootout does
     for the runner. False: still loaded, or launchctl could not tell, and its plist must stay so a re-run retries."""
-    domain = f"{agent_domain(ctx)}/{label}"
-    run([LAUNCHCTL, "bootout", domain])
+    domain = f"{companion_domain(ctx, label)}/{label}"
+    run(priv(ctx, [LAUNCHCTL, "bootout", domain]))
     deadline = time.monotonic() + wait_s
-    while run([LAUNCHCTL, "print", domain])[0] != LAUNCHCTL_NOT_FOUND:
+    while run(priv(ctx, [LAUNCHCTL, "print", domain]))[0] != LAUNCHCTL_NOT_FOUND:
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.25)
@@ -4001,8 +4016,8 @@ def bootout_watch(ctx: Context, label: str, wait_s: float = 15.0) -> bool:
 
 def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
     """Load the watch agent's plist (after watch_unloaded). The watch loop holds no job, so it is never waited for."""
-    domain = agent_domain(ctx)
-    code, out = run([LAUNCHCTL, "bootstrap", domain, act["path"]])
+    domain = companion_domain(ctx, act["label"])
+    code, out = run(priv(ctx, [LAUNCHCTL, "bootstrap", domain, act["path"]]))
     act["bootstrapped"] = code == 0
     if code != 0:
         act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
@@ -4068,8 +4083,83 @@ def relay_socket(ctx: Context) -> Path:
 
 
 def relay_plist_path(ctx: Context) -> Path | None:
-    """The dedicated runner's LAN relay LaunchAgent, or None when its entry declares no lanRelay."""
-    return ctx.agents / f"{relay_label(ctx)}.plist" if relay_of(ctx) else None
+    """The dedicated runner's LAN relay LaunchDaemon (system domain: it must outlive a logout), or None when its entry
+    declares no lanRelay. A sandbox HOME keeps it under HOME/Library/LaunchDaemons."""
+    if not relay_of(ctx):
+        return None
+    base = ctx.home / "Library/LaunchDaemons" if ctx.sandbox else SYSTEM_DAEMON_DIR
+    return base / f"{relay_label(ctx)}.plist"
+
+
+def relay_legacy_agent_path(ctx: Context) -> Path:
+    """Where earlier installs put the relay: a gui/<uid> LaunchAgent, which dies at logout (incident #1174)."""
+    return ctx.agents / f"{relay_label(ctx)}.plist"
+
+
+def priv(ctx: Any, argv: list[str]) -> list[str]:
+    """argv run as root through sudo (a sandbox HOME, or root itself, runs it as is)."""
+    return argv if getattr(ctx, "sandbox", False) or os.geteuid() == 0 else [SUDO, *argv]
+
+
+def companion_domain(ctx: Any, label: str) -> str:
+    """The launchd domain a companion loads into: the relay is a system LaunchDaemon, the watch loop a LaunchAgent."""
+    return "system" if label.endswith(".relay") else agent_domain(ctx)
+
+
+def companion_loaded(ctx: Any, label: str) -> bool:
+    return run(priv(ctx, [LAUNCHCTL, "print", f"{companion_domain(ctx, label)}/{label}"]))[0] == 0
+
+
+def install_companion_file(ctx: Context, act: dict[str, Any], data: bytes, mode: int) -> None:
+    """Write a companion plist: the relay's is root-owned in /Library/LaunchDaemons (through sudo), a watch agent's is
+    this user's."""
+    if act["kind"] == "relay":
+        install_system_file(ctx, Path(act["path"]), data, mode)
+    else:
+        write_atomic(Path(act["path"]), data, mode)
+
+
+def install_system_file(ctx: Any, path: Path, data: bytes, mode: int) -> None:
+    if getattr(ctx, "sandbox", False):
+        write_atomic(path, data, mode)
+        return
+    with tempfile.NamedTemporaryFile(prefix="glaeda-runner-", suffix=".plist", delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fchmod(tmp.fileno(), mode)
+        staged = Path(tmp.name)
+    try:
+        code, out = run(priv(ctx, ["/usr/bin/install", "-o", "root", "-g", "wheel", "-m", oct(mode)[2:],
+                                   os.fspath(staged), os.fspath(path)]))
+        if code != 0:
+            raise OSError(out or f"sudo install exited {code}")
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def remove_companion_file(ctx: Any, act: dict[str, Any]) -> None:
+    path = Path(act["path"])
+    if act.get("kind") == "relay" and not getattr(ctx, "sandbox", False):
+        run(priv(ctx, ["/bin/rm", "-f", os.fspath(path)]))
+    else:
+        path.unlink(missing_ok=True)
+
+
+def drop_legacy_relay(ctx: Context, act: dict[str, Any]) -> str | None:
+    """Boot out and remove the relay's old gui/<uid> LaunchAgent (the daemon binds the same socket). The reason it
+    could not, else None."""
+    legacy = relay_legacy_agent_path(ctx)
+    if not ctx.skip_launchctl:
+        domain = f"{agent_domain(ctx)}/{act['label']}"
+        run([LAUNCHCTL, "bootout", domain])
+        deadline = time.monotonic() + 15
+        while run([LAUNCHCTL, "print", domain])[0] != LAUNCHCTL_NOT_FOUND:
+            if time.monotonic() >= deadline:
+                return f"launchd still has the old gui relay agent {domain}; nothing else changed, re-run"
+            time.sleep(0.25)
+    legacy.unlink(missing_ok=True)
+    act["legacyAgentRemoved"] = True
+    return None
 
 
 def relay_plist(ctx: Context) -> dict[str, Any]:
@@ -4089,10 +4179,14 @@ def relay_plist(ctx: Context) -> dict[str, Any]:
     else:
         address, port = relay.rsplit(":", 1)
         argv = [LAN_RELAY_NC, "-G", str(LAN_RELAY_CONNECT_S), "-w", str(LAN_RELAY_IDLE_S), address, port]
+    info = pwd.getpwuid(ctx.uid)
     return {"Label": relay_label(ctx),
             "ProgramArguments": argv,
+            "UserName": info.pw_name,
             "inetdCompatibility": {"Wait": False},
+            # launchd binds a daemon's socket as root: keep it this runner user's own, mode 0600
             "Sockets": {"Listener": {"SockPathName": os.fspath(relay_socket(ctx)), "SockPathMode": 0o600,
+                                     "SockPathOwner": ctx.uid, "SockPathGroup": getattr(info, "pw_gid", 20),
                                      "SockType": "stream"}},
             "ProcessType": "Interactive",
             "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner-{ctx.dedicated['name']}.relay.err")}
