@@ -15387,26 +15387,48 @@ class BrokerRouteTest(BrokerBase):
 
     def test_jq_and_template_are_passed_through(self) -> None:
         self.cache_pr(7, {"state": "OPEN"})
-        for shape in (["-q", ".state"], ["--jq", ".state"], ["--template", "{{.state}}"]):
+        for shape in (["-q", ".state | ascii_downcase"], ["--jq", '.state+"x"'], ["--template", "{{.state}}"]):
             with self.subTest(shape=shape):
                 _code, out, _err, passed = self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state", *shape])
                 self.assertEqual(out, "")
                 self.assertIsNotNone(passed)
 
     def test_a_jq_read_is_counted_but_never_served(self) -> None:
-        """broker_plan's decision for `--jq`: the key, so cmd_gh counts it toward a watch, and no
-        answer. Every other extra flag, and a `--jq` gh would reject, still gets no key."""
+        """broker_plan's decision for a `--jq` filter other than `.FIELD` (BROKER_JQ_FIELD): the key, so cmd_gh
+        counts it toward a watch, and no answer. Every other extra flag, and a `--jq` gh would reject, still gets
+        no key."""
         key = self.cache_pr(7, {"state": "OPEN", "title": "a fix"})
         now = time.time()
         base = ["pr", "view", "7", "-R", "o/r", "--json", "state,title"]
-        for shape in (["--jq", ".state"], ["--jq=.state"], ["-q", ".state"], ["-q.state"],
-                      ["--jq", ".state", "-q", ".title"]):
+        for shape in (["--jq", ".state | ascii_downcase"], ['--jq=.state+" "+.title'], ["-q", ".state.x"],
+                      ["-q.body"], ["--jq", ".state", "-q", ".title"], ["--jq", ".[]"]):
             with self.subTest(shape=shape):
                 self.assertEqual(gg.broker_plan([*base, *shape], now), ("pass", None, key))
         self.assertEqual(gg.broker_plan(["pr", "view", "https://github.com/o/r/pull/7", "--json", "state",
-                                         "--jq", ".state"], now), ("pass", None, key))
+                                         "--jq", ".state | length"], now), ("pass", None, key))
         self.assertEqual(gg.broker_plan(["run", "view", "12", "-R", "o/r", "--json", "status,conclusion",
-                                         "-q", ".status"], now), ("pass", None, "run:o/r/12"))
+                                         "-q", ".status+.conclusion"], now), ("pass", None, "run:o/r/12"))
+
+    def test_a_jq_read_of_one_field_is_served_as_gh_prints_it(self) -> None:
+        """BROKER_JQ_FIELD: the waiter loop `gh pr view N --json state -q .state` is answered from the daemon's
+        copy, in gh's shape: a string bare, a bool or a number as JSON. A stale copy, a null and a tty still go to
+        gh (the 50 reads per landed PR this saves: cmuxterm-hq goals/writes-over-reads.md)."""
+        key = self.cache_pr(7, {"state": "MERGED", "title": "a fix", "isDraft": False, "number": 7, "mergedAt": None})
+        now = time.time()
+        base = ["pr", "view", "7", "-R", "o/r"]
+        for args, line in (([*base, "--json", "state", "-q", ".state"], "MERGED"),
+                           ([*base, "--json", "state", "--jq", ".state"], "MERGED"),
+                           ([*base, "--json=state,title", "--jq=.title"], "a fix"),
+                           ([*base, "--json", "state", "-q.state"], "MERGED"),
+                           ([*base, "--json", "isDraft", "-q", ".isDraft"], "false"),
+                           ([*base, "--json", "number", "-q", ".number"], "7")):
+            with self.subTest(args=args):
+                self.assertEqual(gg.broker_plan(args, now), ("serve", line, key))
+        self.assertEqual(gg.broker_plan([*base, "--json", "mergedAt", "-q", ".mergedAt"], now), ("pass", None, key))
+        _code, out, _err, passed = self.run_gh([*base, "--json", "state", "-q", ".state"])
+        self.assertEqual((out, passed), ("MERGED\n", None))
+        self.cache_pr(7, {"state": "OPEN"}, age=gg.BROKER_MAX_AGE + 5)
+        self.assertEqual(gg.broker_plan([*base, "--json", "state", "-q", ".state"], time.time()), ("pass", None, key))
         for args in ([*base, "--template", "{{.state}}"], [*base, "--jq", ".state", "--template", "x"],
                      [*base, "--jq", ".state", "--web"], [*base, "--jq"], [*base, "-q"],
                      [*base, "--jq", ".state", "--repo"],

@@ -19657,8 +19657,10 @@ def land_check_fingerprint(cache: dict | None) -> str:
 
 # The change feed (cmuxterm-hq goals/writes-over-reads.md, `glaeda-gh watch`). An agent waiting on a PR polled it:
 # a PR view every two minutes, or `status pr` again after every wake, and each read is a read call whether or not
-# anything moved (2026-11-28 10:48-12:07Z, one agent lane: 39 ticks over two PRs, 78 PR reads, 39 per landed PR,
-# for two merges glaeda-land pushed to the session anyway). The daemon already sees every change when it stores a read, so every
+# anything moved (2026-11-28 10:24-12:10Z, one agent lane: two waiters, 100 PR reads for two landed PRs, 50 per
+# landed PR, for two merges glaeda-land pushed to the session anyway). Those waiters were `gh pr view` loops; `wait
+# pr --until merged` already spends no GitHub read of its own (the daemon rules on it, subscribe_wait), so the
+# saving is a waiter on `wait` or `watch` instead of a loop of reads. The daemon already sees every change when it stores a read, so every
 # store that changes what a waiter acts on appends one line to events.jsonl, numbered by a version that only grows
 # (the Kubernetes resourceVersion shape): `watch --since V` answers the lines after V for the PRs named, and blocks
 # on the local file (no GitHub read) until there is one. Three kinds: pr_state (state, merge commit, head, draft, a
@@ -40993,6 +40995,34 @@ def broker_real_gh() -> str:
     raise WatchError("no real gh found on PATH")
 
 
+# The one `--jq` filter the broker computes: `.FIELD`, one top-level field of the `--json` list, a string, number or
+# bool. A waiter loop polls a PR as `gh pr view N --json state -q .state`, and until this every such read went to
+# GitHub (broker_plan counted it, never served it): 2026-11-28 10:48-12:07Z one lane's two waiters made 100 PR reads
+# for two landed PRs, 50 per landed PR, all `-q`, none served (cmuxterm-hq goals/writes-over-reads.md). gh prints a
+# string filter result bare and a number or bool as JSON, each on its own line; a null (a time not yet set) is left
+# to gh, and so is anything with a pipe, an operator, a path deeper than one field, or more than one `--jq`.
+BROKER_JQ_FIELD = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def broker_serve_jq(key: str, fields: list[str], table: dict[str, tuple[str, str]], values: dict[str, str],
+                    raw_args: list[str], now: float) -> str | None:
+    """gh's output for `--json FIELDS --jq .FIELD` from the cache, or None (BROKER_JQ_FIELD)."""
+    if sum(1 for a in raw_args if a in ("--jq", "-q") or a.startswith(("--jq=", "-q"))) != 1:
+        return None
+    match = BROKER_JQ_FIELD.fullmatch(values.get("--jq") or values.get("-q") or "")
+    if match is None or match.group(1) not in fields:
+        return None
+    line = broker_serve(key, fields, table, now)
+    if line is None:
+        return None
+    value = json.loads(line).get(match.group(1))
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bool, int)):
+        return json.dumps(value)
+    return None
+
+
 def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | None]:
     """(route, payload, key). route is 'serve', 'refuse' or 'pass'. Pure: no watch is registered and
     nothing is written, so a test can read the decision without touching the daemon's state."""
@@ -41019,7 +41049,11 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
         # Nothing to gain from watching a target the cache could not have answered anyway.
         return "pass", None, None
     if count_only:
-        # `--jq`: the cache holds every field asked for, but not gh's filter. Counted, never served.
+        # `--jq`: the cache holds every field asked for. One filter is computed here, `.FIELD` for one scalar field
+        # asked for (BROKER_JQ_FIELD); any other filter is counted, never served.
+        line = broker_serve_jq(key, fields, table, values, args, now)
+        if line is not None and not sys.stdout.isatty():
+            return "serve", line, key
         return "pass", None, key
     line = broker_serve(key, fields, table, now)
     if line is not None and sys.stdout.isatty():
