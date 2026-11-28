@@ -5875,7 +5875,7 @@ def status_path(root: str, sha: str) -> str:
 
 def head_pending(checks: dict, statuses: list[dict]) -> bool:
     """A head with a check run not completed, or a status pending, by its REST reads (rest_head)."""
-    return (any(str(c.get("status") or "").lower() != "completed" for c in checks.get("check_runs") or [])
+    return (any(finished_status(c).lower() != "completed" for c in checks.get("check_runs") or [])
             or any(str(s.get("state") or "").lower() in {"pending", "expected"} for s in statuses))
 
 
@@ -6213,10 +6213,10 @@ def parse_pr(node: dict) -> dict:
             order = (0, c.get("createdAt") or "")
         else:
             workflow = (((c.get("checkSuite") or {}).get("workflowRun") or {}).get("workflow") or {}).get("name")
-            check = {"name": c.get("name"), "workflow": workflow, "status": c.get("status"),
+            check = {"name": c.get("name"), "workflow": workflow, "status": finished_status(c),
                      "conclusion": c.get("conclusion"), "url": c.get("detailsUrl"), "id": c.get("id"),
                      "runId": run_id or None, "startedAt": c.get("startedAt"), "completedAt": c.get("completedAt")}
-            if c.get("status") != "COMPLETED" and c.get("databaseId"):
+            if check["status"] != "COMPLETED" and c.get("databaseId"):
                 check["jobId"] = c["databaseId"]  # an unfinished run's Actions job, for straggler_cut's jobs read
             # databaseId first: a queued rerun has no startedAt yet but is still the newer attempt
             order = (c.get("databaseId") or 0, c.get("startedAt") or "")
@@ -6558,6 +6558,21 @@ def heads_repos(keys: list[str]) -> list[str]:
     return out
 
 
+def finished_status(node: dict) -> str:
+    """A check run NODE's status, COMPLETED when it carries a conclusion and a completion time, whatever its status
+    says (GraphQL `completedAt`, REST `completed_at`; the case of the status is kept). GitHub keeps torn records:
+    manaflow-ai/cmux#52236's "cmux-next push head preflight" at dd25ad19 read IN_PROGRESS beside SUCCESS and a
+    completedAt 7 s after it started (job 137944317666, its run completed success at 19:29Z), so its head never read
+    settled, every wait on it was "running", and glaeda land stopped it checks_stuck after 409 min. A conclusion
+    without its completion time is still unfinished: the one rule land_judge's _is_finished and hq's handbook page
+    finished-check-read-as-running keep, so the daemon and the judge never disagree on whether a check ended."""
+    status = str(node.get("status") or "")
+    if status.lower() == "completed" or node.get("conclusion") is None \
+            or not (node.get("completedAt") or node.get("completed_at")):
+        return status
+    return "completed" if status.islower() else "COMPLETED"
+
+
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "",
                   order: dict | None = None, failed: dict | None = None) -> None:
     """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
@@ -6582,9 +6597,10 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
         owner = (((suite.get("workflowRun") or {}).get("workflow") or {}).get("name") or slug or "check")
         key = f"{prefix}{owner} / {item['name']}"
         conclusion = (item.get("conclusion") or "").lower()
-        runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
+        status = finished_status(item).lower()
+        runs.setdefault(key, []).append((item.get("databaseId") or 0, status, conclusion))
         if order is not None:  # head_data's `runs`: each run's own id and times, and its identity (run_identity)
-            order.setdefault(key, []).append([item.get("databaseId") or 0, (item.get("status") or "").lower(),
+            order.setdefault(key, []).append([item.get("databaseId") or 0, status,
                                               conclusion, item.get("startedAt") or "", item.get("completedAt") or "",
                                               run_identity(item, suite)])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
@@ -22712,6 +22728,11 @@ class LandQueue:
             self.ended(e, state, merge_sha, "re-arm: the PR's cached state shows it")
             return False
         at = float(st.get("at") or 0)
+        # An OPEN copy read before the stop is no proof the PR is still open: manaflow-ai/cmux#52236 closed at
+        # 2026-11-24 10:49Z and was re-armed and judged hour after hour on its OPEN copy until 00:03Z, as a red it
+        # could never land. Its state is read before the re-armed judgment (state_first), once.
+        read_at = (self.cache_of(e["key"]) or {}).get("dataAt")
+        stale_copy = not isinstance(read_at, (int, float)) or isinstance(read_at, bool) or read_at < at
         cleared = code == "retry_deadline" and self.mh_changed_at > at
         latched = code == "retry_deadline" and self.latch_owed(e, at)
         if not cleared and not latched and self.now - at < LAND_REARM_AFTER:
@@ -22724,6 +22745,8 @@ class LandQueue:
         e["rearms"] = {"day": day, "n": n + 1, "at": self.now, "code": code}  # attributable to the stop it answered
         e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
                  lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
+        if stale_copy:
+            e["stateFirst"] = "re-armed on a copy read before its stop"
         if latched:
             e["waitBudget"] = None  # its budget was spent by the latch, not by land_judge: a whole one
         why = "land_judge's checkout was refreshed" if cleared else "the login's latch that held it cleared" \
@@ -29171,8 +29194,9 @@ class LandQueue:
 
     def state_due(self, e: dict, kind: str | None) -> bool:
         """Under the lock. Whether the PR's state is read before KIND is taken: GitHub said the PR is closed
-        (closedSeen), or a base-changing step on an upstream host's copy older than LAND_REFRESH_AFTER."""
-        if e.get("closedSeen"):
+        (closedSeen), E was re-armed on a copy read before its stop (stateFirst: rearm), or a base-changing step on an
+        upstream host's copy older than LAND_REFRESH_AFTER."""
+        if e.get("closedSeen") or e.get("stateFirst"):
             return True
         if kind not in LAND_STATE_FIRST_KINDS or not self.reads_upstream():
             return False
@@ -29193,11 +29217,13 @@ class LandQueue:
             self.check(e)
             seen = e.get("closedSeen") or {}
             self.history(e, "state_read", state=state or "unreadable", before=kind,
-                         why="GitHub said it is closed" if seen else "stale copy before a base-changing step")
+                         why="GitHub said it is closed" if seen else e.get("stateFirst")
+                         or "stale copy before a base-changing step")
             if self.ended(e, state, merge_sha, "a state read shows it"):
                 return False
             if state == "OPEN":
                 e.pop("closedSeen", None)
+                e.pop("stateFirst", None)
                 e.pop("stateUnread", None)
                 e["stateReadAt"] = self.now
                 if seen:
